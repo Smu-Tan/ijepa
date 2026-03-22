@@ -6,6 +6,8 @@
 #
 
 import os
+import math
+from contextlib import ExitStack
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
@@ -28,6 +30,19 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils.tensorboard import SummaryWriter
+
+try:
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+except ImportError:
+    Progress = None
 
 from src.masks.multiblock import MaskCollator as MBMaskCollator
 from src.masks.utils import apply_masks
@@ -78,6 +93,7 @@ def main(args, resume_preempt=False):
     copy_data = args['meta']['copy_data']
     pred_depth = args['meta']['pred_depth']
     pred_emb_dim = args['meta']['pred_emb_dim']
+    use_grad_checkpoint = args['meta'].get('use_grad_checkpoint', False)
     if not torch.cuda.is_available():
         device = torch.device('cpu')
     else:
@@ -95,6 +111,8 @@ def main(args, resume_preempt=False):
     num_workers = args['data']['num_workers']
     root_path = args['data']['root_path']
     image_folder = args['data']['image_folder']
+    dataset_backend = args['data'].get('dataset_backend', 'imagefolder')
+    hf_dataset_path = args['data'].get('hf_dataset_path')
     crop_size = args['data']['crop_size']
     crop_scale = args['data']['crop_scale']
     # --
@@ -120,11 +138,14 @@ def main(args, resume_preempt=False):
     start_lr = args['optimization']['start_lr']
     lr = args['optimization']['lr']
     final_lr = args['optimization']['final_lr']
+    accum_steps = max(1, int(args['optimization'].get('accum_steps', 1)))
 
     # -- LOGGING
     folder = args['logging']['folder']
     tag = args['logging']['write_tag']
+    checkpoint_every = args['logging'].get('checkpoint_freq', checkpoint_freq)
 
+    os.makedirs(folder, exist_ok=True)
     dump = os.path.join(folder, 'params-ijepa.yaml')
     with open(dump, 'w') as f:
         yaml.dump(args, f)
@@ -145,6 +166,7 @@ def main(args, resume_preempt=False):
     log_file = os.path.join(folder, f'{tag}_r{rank}.csv')
     save_path = os.path.join(folder, f'{tag}' + '-ep{epoch}.pth.tar')
     latest_path = os.path.join(folder, f'{tag}-latest.pth.tar')
+    tb_folder = os.path.join(folder, 'tensorboard')
     load_path = None
     if load_model:
         load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
@@ -157,6 +179,7 @@ def main(args, resume_preempt=False):
                            ('%.5f', 'mask-A'),
                            ('%.5f', 'mask-B'),
                            ('%d', 'time (ms)'))
+    tb_writer = SummaryWriter(log_dir=tb_folder) if rank == 0 else None
 
     # -- init model
     encoder, predictor = init_model(
@@ -165,7 +188,8 @@ def main(args, resume_preempt=False):
         crop_size=crop_size,
         pred_depth=pred_depth,
         pred_emb_dim=pred_emb_dim,
-        model_name=model_name)
+        model_name=model_name,
+        use_grad_checkpoint=use_grad_checkpoint)
     target_encoder = copy.deepcopy(encoder)
 
     # -- make data transforms
@@ -200,9 +224,14 @@ def main(args, resume_preempt=False):
             rank=rank,
             root_path=root_path,
             image_folder=image_folder,
+            dataset_backend=dataset_backend,
+            hf_dataset_path=hf_dataset_path,
             copy_data=copy_data,
             drop_last=True)
     ipe = len(unsupervised_loader)
+    logger.info(f'Iterations per epoch: {ipe}')
+    optimizer_updates_per_epoch = math.ceil(ipe / accum_steps)
+    logger.info(f'Optimizer updates per epoch: {optimizer_updates_per_epoch}')
 
     # -- init optimizer and scheduler
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
@@ -213,20 +242,26 @@ def main(args, resume_preempt=False):
         start_lr=start_lr,
         ref_lr=lr,
         final_lr=final_lr,
-        iterations_per_epoch=ipe,
+        iterations_per_epoch=optimizer_updates_per_epoch,
         warmup=warmup,
         num_epochs=num_epochs,
         ipe_scale=ipe_scale,
         use_bfloat16=use_bfloat16)
-    encoder = DistributedDataParallel(encoder, static_graph=True)
-    predictor = DistributedDataParallel(predictor, static_graph=True)
-    target_encoder = DistributedDataParallel(target_encoder)
+    use_ddp = torch.distributed.is_available() and torch.distributed.is_initialized() and world_size > 1
+    if use_ddp:
+        # Be conservative when using gradient accumulation/checkpointing. DDP's
+        # static-graph fast path can conflict with repeated backward passes.
+        ddp_static_graph = (accum_steps == 1) and (not use_grad_checkpoint)
+        encoder = DistributedDataParallel(encoder, static_graph=ddp_static_graph)
+        predictor = DistributedDataParallel(predictor, static_graph=ddp_static_graph)
+        target_encoder = DistributedDataParallel(target_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
 
     # -- momentum schedule
-    momentum_scheduler = (ema[0] + i*(ema[1]-ema[0])/(ipe*num_epochs*ipe_scale)
-                          for i in range(int(ipe*num_epochs*ipe_scale)+1))
+    total_optimizer_updates = int(optimizer_updates_per_epoch * num_epochs * ipe_scale)
+    momentum_scheduler = (ema[0] + i*(ema[1]-ema[0])/max(total_optimizer_updates, 1)
+                          for i in range(total_optimizer_updates + 1))
 
     start_epoch = 0
     # -- load training checkpoint
@@ -239,7 +274,7 @@ def main(args, resume_preempt=False):
             target_encoder=target_encoder,
             opt=optimizer,
             scaler=scaler)
-        for _ in range(start_epoch*ipe):
+        for _ in range(start_epoch*optimizer_updates_per_epoch):
             scheduler.step()
             wd_scheduler.step()
             next(momentum_scheduler)
@@ -260,12 +295,20 @@ def main(args, resume_preempt=False):
         }
         if rank == 0:
             torch.save(save_dict, latest_path)
-            if (epoch + 1) % checkpoint_freq == 0:
+            if epoch % checkpoint_every == 0:
                 torch.save(save_dict, save_path.format(epoch=f'{epoch + 1}'))
+
+    def format_metrics(loss_meter, maskA_meter, maskB_meter, lr_value, wd_value, time_meter):
+        mem_gb = torch.cuda.max_memory_allocated() / 1024.**3 if torch.cuda.is_available() else 0.0
+        return (
+            f'loss {loss_meter.avg:.3f} | masks {maskA_meter.avg:.1f}/{maskB_meter.avg:.1f} | '
+            f'wd {wd_value:.2e} | lr {lr_value:.2e} | mem {mem_gb:.2f} GB | '
+            f'{time_meter.avg:.1f} ms'
+        )
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
-        logger.info('Epoch %d' % (epoch + 1))
+        logger.info('Epoch %d/%d (iterations: %d)' % (epoch + 1, num_epochs, ipe))
 
         # -- update distributed-data-loader epoch
         unsupervised_sampler.set_epoch(epoch)
@@ -274,8 +317,37 @@ def main(args, resume_preempt=False):
         maskA_meter = AverageMeter()
         maskB_meter = AverageMeter()
         time_meter = AverageMeter()
+        optimizer.zero_grad()
+        accum_count = 0
+        accum_target = accum_steps
+        last_lr = optimizer.param_groups[0]['lr']
+        last_wd = next(
+            (group['weight_decay'] for group in optimizer.param_groups
+             if group.get('weight_decay', 0) > 0),
+            0.0)
+        progress = None
+        progress_task = None
+        if rank == 0 and Progress is not None:
+            progress = Progress(
+                TextColumn('[bold cyan]{task.description}'),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                TextColumn('{task.fields[metrics]}'),
+                refresh_per_second=2,
+            )
+            progress.start()
+            progress_task = progress.add_task(
+                f'Epoch {epoch + 1}/{num_epochs}',
+                total=ipe,
+                metrics=format_metrics(loss_meter, maskA_meter, maskB_meter, last_lr, last_wd, time_meter),
+            )
 
         for itr, (udata, masks_enc, masks_pred) in enumerate(unsupervised_loader):
+            global_step = epoch * ipe + itr
+            if accum_count == 0:
+                accum_target = min(accum_steps, ipe - itr)
 
             def load_imgs():
                 # -- unsupervised imgs
@@ -288,10 +360,6 @@ def main(args, resume_preempt=False):
             maskB_meter.update(len(masks_pred[0][0]))
 
             def train_step():
-                _new_lr = scheduler.step()
-                _new_wd = wd_scheduler.step()
-                # --
-
                 def forward_target():
                     with torch.no_grad():
                         h = target_encoder(imgs)
@@ -312,51 +380,107 @@ def main(args, resume_preempt=False):
                     loss = AllReduce.apply(loss)
                     return loss
 
+                should_update = (accum_count + 1) == accum_target
+
                 # Step 1. Forward
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
-                    h = forward_target()
-                    z = forward_context()
-                    loss = loss_fn(z, h)
+                with ExitStack() as sync_stack:
+                    if use_ddp and not should_update:
+                        sync_stack.enter_context(encoder.no_sync())
+                        sync_stack.enter_context(predictor.no_sync())
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
+                        h = forward_target()
+                        z = forward_context()
+                        loss = loss_fn(z, h)
+                        scaled_loss = loss / accum_target
 
                 #  Step 2. Backward & step
                 if use_bfloat16:
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+                    scaler.scale(scaled_loss).backward()
+                    if should_update:
+                        _new_lr = scheduler.step()
+                        _new_wd = wd_scheduler.step()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        _new_lr = last_lr
+                        _new_wd = last_wd
                 else:
-                    loss.backward()
-                    optimizer.step()
-                grad_stats = grad_logger(encoder.named_parameters())
-                optimizer.zero_grad()
+                    scaled_loss.backward()
+                    if should_update:
+                        _new_lr = scheduler.step()
+                        _new_wd = wd_scheduler.step()
+                        optimizer.step()
+                    else:
+                        _new_lr = last_lr
+                        _new_wd = last_wd
+                grad_stats = None
+                if should_update:
+                    grad_stats = grad_logger(encoder.named_parameters())
+                    optimizer.zero_grad()
 
                 # Step 3. momentum update of target encoder
-                with torch.no_grad():
-                    m = next(momentum_scheduler)
-                    for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
-                        param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
+                if should_update:
+                    with torch.no_grad():
+                        m = next(momentum_scheduler)
+                        for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
+                            param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
 
                 return (float(loss), _new_lr, _new_wd, grad_stats)
             (loss, _new_lr, _new_wd, grad_stats), etime = gpu_timer(train_step)
+            accum_count = (accum_count + 1) % accum_target
+            if accum_count == 0:
+                last_lr = _new_lr
+                last_wd = _new_wd
             loss_meter.update(loss)
             time_meter.update(etime)
+            if progress is not None:
+                progress.update(
+                    progress_task,
+                    advance=1,
+                    metrics=format_metrics(
+                        loss_meter,
+                        maskA_meter,
+                        maskB_meter,
+                        last_lr,
+                        last_wd,
+                        time_meter,
+                    ),
+                )
 
             # -- Logging
             def log_stats():
                 csv_logger.log(epoch + 1, itr, loss, maskA_meter.val, maskB_meter.val, etime)
+                if tb_writer is not None:
+                    tb_writer.add_scalar('train/loss', loss, global_step)
+                    tb_writer.add_scalar('train/lr', _new_lr, global_step)
+                    tb_writer.add_scalar('train/weight_decay', _new_wd, global_step)
+                    tb_writer.add_scalar('train/mask_enc', maskA_meter.val, global_step)
+                    tb_writer.add_scalar('train/mask_pred', maskB_meter.val, global_step)
+                    tb_writer.add_scalar('train/iter_time_ms', etime, global_step)
+                    tb_writer.add_scalar(
+                        'train/max_memory_gb',
+                        torch.cuda.max_memory_allocated() / 1024.**3,
+                        global_step)
+                    if grad_stats is not None:
+                        tb_writer.add_scalar('train/grad_first_layer', grad_stats.first_layer, global_step)
+                        tb_writer.add_scalar('train/grad_last_layer', grad_stats.last_layer, global_step)
+                        tb_writer.add_scalar('train/grad_min', grad_stats.min, global_step)
+                        tb_writer.add_scalar('train/grad_max', grad_stats.max, global_step)
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
-                    logger.info('[%d, %5d] loss: %.3f '
-                                'masks: %.1f %.1f '
-                                '[wd: %.2e] [lr: %.2e] '
-                                '[mem: %.2e] '
-                                '(%.1f ms)'
-                                % (epoch + 1, itr,
-                                   loss_meter.avg,
-                                   maskA_meter.avg,
-                                   maskB_meter.avg,
-                                   _new_wd,
-                                   _new_lr,
-                                   torch.cuda.max_memory_allocated() / 1024.**2,
-                                   time_meter.avg))
+                    if progress is None:
+                        logger.info('[%d, %5d] loss: %.3f '
+                                    'masks: %.1f %.1f '
+                                    '[wd: %.2e] [lr: %.2e] '
+                                    '[mem: %.2f GB] '
+                                    '(%.1f ms)'
+                                    % (epoch + 1, itr,
+                                       loss_meter.avg,
+                                       maskA_meter.avg,
+                                       maskB_meter.avg,
+                                       _new_wd,
+                                       _new_lr,
+                                       torch.cuda.max_memory_allocated() / 1024.**3,
+                                       time_meter.avg))
 
                     if grad_stats is not None:
                         logger.info('[%d, %5d] grad_stats: [%.2e %.2e] (%.2e, %.2e)'
@@ -372,7 +496,17 @@ def main(args, resume_preempt=False):
 
         # -- Save Checkpoint after every epoch
         logger.info('avg. loss %.3f' % loss_meter.avg)
+        if progress is not None:
+            progress.stop()
+        if tb_writer is not None:
+            tb_writer.add_scalar('epoch/loss_avg', loss_meter.avg, epoch + 1)
+            tb_writer.add_scalar('epoch/mask_enc_avg', maskA_meter.avg, epoch + 1)
+            tb_writer.add_scalar('epoch/mask_pred_avg', maskB_meter.avg, epoch + 1)
+            tb_writer.add_scalar('epoch/time_ms_avg', time_meter.avg, epoch + 1)
         save_checkpoint(epoch+1)
+
+    if tb_writer is not None:
+        tb_writer.close()
 
 
 if __name__ == "__main__":

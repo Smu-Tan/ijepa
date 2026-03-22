@@ -11,6 +11,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from src.utils.tensors import (
     trunc_normal_,
@@ -234,9 +235,11 @@ class VisionTransformerPredictor(nn.Module):
         drop_path_rate=0.0,
         norm_layer=nn.LayerNorm,
         init_std=0.02,
+        use_grad_checkpoint=False,
         **kwargs
     ):
         super().__init__()
+        self.use_grad_checkpoint = use_grad_checkpoint
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
@@ -316,7 +319,10 @@ class VisionTransformerPredictor(nn.Module):
 
         # -- fwd prop
         for blk in self.predictor_blocks:
-            x = blk(x)
+            if self.use_grad_checkpoint and self.training:
+                x = checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
         x = self.predictor_norm(x)
 
         # -- return preds for mask tokens
@@ -346,9 +352,11 @@ class VisionTransformer(nn.Module):
         drop_path_rate=0.0,
         norm_layer=nn.LayerNorm,
         init_std=0.02,
+        use_grad_checkpoint=False,
         **kwargs
     ):
         super().__init__()
+        self.use_grad_checkpoint = use_grad_checkpoint
         self.num_features = self.embed_dim = embed_dim
         self.num_heads = num_heads
         # --
@@ -417,7 +425,10 @@ class VisionTransformer(nn.Module):
 
         # -- fwd prop
         for i, blk in enumerate(self.blocks):
-            x = blk(x)
+            if self.use_grad_checkpoint and self.training:
+                x = checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
 
         if self.norm is not None:
             x = self.norm(x)

@@ -15,6 +15,7 @@ from logging import getLogger
 
 import torch
 import torchvision
+from datasets import load_dataset
 
 _GLOBAL_SEED = 0
 logger = getLogger()
@@ -25,7 +26,7 @@ def make_imagenet1k(
     batch_size,
     collator=None,
     pin_mem=True,
-    num_workers=8,
+    num_workers=40,
     world_size=1,
     rank=0,
     root_path=None,
@@ -33,16 +34,26 @@ def make_imagenet1k(
     training=True,
     copy_data=False,
     drop_last=True,
-    subset_file=None
+    subset_file=None,
+    dataset_backend='imagefolder',
+    hf_dataset_path=None,
 ):
-    dataset = ImageNet(
-        root=root_path,
-        image_folder=image_folder,
-        transform=transform,
-        train=training,
-        copy_data=copy_data,
-        index_targets=False)
+    if dataset_backend == 'hf':
+        dataset = HFImageNet(
+            dataset_path=hf_dataset_path or root_path,
+            transform=transform,
+            train=training)
+    else:
+        dataset = ImageNet(
+            root=root_path,
+            image_folder=image_folder,
+            transform=transform,
+            train=training,
+            copy_data=copy_data,
+            index_targets=False)
     if subset_file is not None:
+        if dataset_backend == 'hf':
+            raise NotImplementedError('subset_file is only supported with the imagefolder backend')
         dataset = ImageNetSubset(dataset, subset_file)
     logger.info('ImageNet dataset created')
     dist_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -61,6 +72,27 @@ def make_imagenet1k(
     logger.info('ImageNet unsupervised data loader created')
 
     return dataset, data_loader, dist_sampler
+
+
+class HFImageNet(torch.utils.data.Dataset):
+
+    def __init__(self, dataset_path, transform=None, train=True):
+        self.dataset_path = dataset_path
+        self.transform = transform
+        split = 'train' if train else 'validation'
+        logger.info(f'loading Hugging Face dataset from {dataset_path} [{split}]')
+        self.dataset = load_dataset(dataset_path, split=split)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        sample = self.dataset[index]
+        img = sample['image']
+        target = sample['label']
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, target
 
 
 class ImageNet(torchvision.datasets.ImageFolder):
