@@ -1,0 +1,50 @@
+meta:
+  mode: finetune
+  freeze_backbone: false
+  use_bfloat16: true
+  use_grad_checkpoint: false
+  copy_data: false
+  model_name: vit_base
+  patch_size: 4
+  feature_mode: avgpool
+  head_type: linear
+  pretrained_checkpoint: /home/stan/ijepa/tiny_in_200/vitb.64-bs.512-ep.300/jepa-latest.pth.tar
+  pretrained_key: target_encoder
+  load_checkpoint: false
+  read_checkpoint: null
+
+data:
+  batch_size: 256
+  eval_batch_size: 256
+  num_workers: 16
+  pin_mem: true
+  root_path: /scratch-shared/stan/ijepa
+  image_folder: tiny-imagenet-200
+  dataset_backend: imagefolder
+  hf_dataset_path: null
+  subset_file: null
+  crop_size: 64
+  eval_resize_size: 73
+  train_resize_scale: [0.8, 1.0]
+  horizontal_flip_prob: 0.5
+  randaugment: true
+  drop_last: false
+  num_classes: 200
+
+optimization:
+  epochs: 100
+  lr: 5.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 5.0e-2
+  layer_decay: 0.75
+  warmup_epochs: 5
+  label_smoothing: 0.1
+  mixup_alpha: 0.0
+  cutmix_alpha: 0.0
+  mixup_prob: 1.0
+  clip_grad: null
+
+logging:
+  folder: /home/stan/ijepa/tiny_in_200/vitb.64-bs.512-ep.300/finetune
+  write_tag: cls
+  checkpoint_freq: 100

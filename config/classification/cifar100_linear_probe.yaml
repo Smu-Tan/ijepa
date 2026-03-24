@@ -1,0 +1,50 @@
+meta:
+  mode: linear_probe
+  freeze_backbone: true
+  use_bfloat16: true
+  use_grad_checkpoint: false
+  copy_data: false
+  model_name: vit_huge
+  patch_size: 14
+  feature_mode: avgpool
+  head_type: bn_linear
+  pretrained_checkpoint: /scratch-shared/stan/ijepa/IN1K-vit.h.14-300e.pth.tar
+  pretrained_key: target_encoder
+  load_checkpoint: false
+  read_checkpoint: null
+
+data:
+  batch_size: 128
+  eval_batch_size: 128
+  num_workers: 16
+  pin_mem: true
+  root_path: /scratch-shared/stan/ijepa
+  image_folder: cifar100_imagefolder
+  dataset_backend: imagefolder
+  hf_dataset_path: null
+  subset_file: null
+  crop_size: 224
+  train_resize_size: 224
+  eval_resize_size: 224
+  train_crop_mode: resize
+  eval_crop_mode: resize
+  train_resize_scale: [0.8, 1.0]
+  horizontal_flip_prob: 0.5
+  randaugment: false
+  drop_last: false
+  num_classes: 100
+
+optimization:
+  epochs: 50
+  lr: 0.05
+  weight_decay: 0.0
+  momentum: 0.9
+  warmup_epochs: 0
+  step_decay_epochs: [15, 30, 45]
+  step_decay_gamma: 1.0
+  label_smoothing: 0.0
+
+logging:
+  folder: /scratch-shared/stan/ijepa-runs/cifar100/vith14-linear-probe-0.06lr-128bs
+  write_tag: cls
+  checkpoint_freq: 10
